@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+from enum import Enum
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -103,7 +104,7 @@ class SendTaskState:
     """SendTaskState is used to track the state of a send task.
     """
     sender_ready: bool = False
-    receiver_ready: bool = False
+    receiver_ready: bool = True
     is_sending: bool = False
     send_done: bool = False
 

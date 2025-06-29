@@ -14,7 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.cpu_connector_utils import (
     DestinationSpec, SourceSpec)
 from vllm.distributed.kv_transfer.kv_connector.v1.ray_gloo_utils import (
-    CPUReceiver, CPUSender, RaySendTaskManager, RaySendTask)
+    CPUReceiver, CPUSender, RaySendTaskManager, RaySendTask, RayDecodeManager)
 from vllm.distributed.parallel_state import create_collective_group
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
@@ -410,12 +410,6 @@ class RayCPUConnector(KVConnectorBase_V1):
                  role: KVConnectorRole) -> None:
         super().__init__(vllm_config, role)
 
-        self._sender_actor = CPUSender.remote()
-        # TODO: name includes dest rank, host, port
-        self._receiver_actor = CPUReceiver.remote()
-        create_collective_group([self._sender_actor, self._receiver_actor],
-                                backend="torch_gloo")
-
         validate_kv_transfer_config(vllm_config.kv_transfer_config)
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self._host = extra_config["host"]
@@ -437,6 +431,12 @@ class RayCPUConnector(KVConnectorBase_V1):
         elif role == KVConnectorRole.WORKER:
             # Prefiller side sender
             if self.kv_role == "kv_producer":
+
+                self._sender_actor = CPUSender.remote()
+                # TODO: name includes dest rank, host, port
+                self._receiver_actor = CPUReceiver.options(name=f"receiver_actor_{self._host}_{self._port}").remote()
+                create_collective_group([self._sender_actor, self._receiver_actor], backend="torch_gloo")
+
                 self._kv_sender = RaySendTaskManager(self._kv_size)
                 self._kv_sender_lock = threading.Lock()
                 self._kv_sender_stop_event = threading.Event()
@@ -447,7 +447,7 @@ class RayCPUConnector(KVConnectorBase_V1):
                 self._kv_sender_thread.start()
 
             elif self.kv_role == "kv_consumer":
-                self._kv_receiver = NixlDecodeManager(
+                self._kv_receiver = RayDecodeManager(
                     self._kv_size,
                     self._host,
                     self._port,
@@ -893,7 +893,7 @@ class RayCPUConnector(KVConnectorBase_V1):
 
         # decoder (kv_consumer) side
         self._kv_receiver.progress()
-        p_ready_reqs = self._kv_receiver.get_finished(len(self._gpu_kv_caches))
+        p_ready_reqs = self._receiver_actor_handle.get_finished(len(self._gpu_kv_caches))
         ret = set()
         for p_req_id in p_ready_reqs:
             if d_req_id := self._decode_req_id_to_prefill_req_id.get(p_req_id):
