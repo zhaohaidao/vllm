@@ -15,7 +15,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.cpu_connector_utils import (
     DestinationSpec, SourceSpec)
 from vllm.distributed.kv_transfer.kv_connector.v1.ray_gloo_utils import (
     CPUReceiver, CPUSender, RaySendTaskManager, RaySendTask, RayDecodeManager)
-from vllm.distributed.parallel_state import create_collective_group
+#from vllm.distributed.parallel_state import create_collective_group
+from ray.experimental.collective import create_collective_group
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.utils import cdiv, round_down
@@ -392,13 +393,13 @@ def validate_kv_transfer_config(
     assert kv_transfer_config is not None, \
         "KV transfer config is not set in the vLLM config"
 
-    extra_config = kv_transfer_config.kv_connector_extra_config
-    assert "host" in extra_config, \
-            "CPUConnector: must have 'host' in kv_connector_extra_config"
-    assert "port" in extra_config, \
-            "CPUConnector: must have 'port' in kv_connector_extra_config"
-    assert "size" in extra_config, \
-            "CPUConnector: must have 'size' in kv_connector_extra_config"
+    #extra_config = kv_transfer_config.kv_connector_extra_config
+    #assert "host" in extra_config, \
+    #        "CPUConnector: must have 'host' in kv_connector_extra_config"
+    #assert "port" in extra_config, \
+    #        "CPUConnector: must have 'port' in kv_connector_extra_config"
+    #assert "size" in extra_config, \
+    #        "CPUConnector: must have 'size' in kv_connector_extra_config"
 
 
 class RayCPUConnector(KVConnectorBase_V1):
@@ -420,11 +421,11 @@ class RayCPUConnector(KVConnectorBase_V1):
         validate_kv_transfer_config(vllm_config.kv_transfer_config)
         logger.info("✓ KV transfer configuration validated successfully")
         
-        extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
-        self._host = extra_config["host"]
-        self._port = int(extra_config["port"])
+        #extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
+        self._host = vllm_config.kv_transfer_config.kv_ip
+        self._port = int(vllm_config.kv_transfer_config.kv_port)
         # Convert GB to bytes and align to 4K for storage size
-        kv_size_in_bytes = float(extra_config["size"]) * (1 << 30)
+        kv_size_in_bytes = float(40) * (1 << 30)
         kv_size_in_bytes = int(kv_size_in_bytes) & (~0xFFF)  # Align to 4K
         self._kv_size = kv_size_in_bytes
 
@@ -976,6 +977,8 @@ class RayCPUConnector(KVConnectorBase_V1):
                 task = self._kv_sender.create_send_task(
                     source_spec=source_spec,
                     destination_spec=dest_spec,
+                    sender_actor=self._sender_actor,
+                    receiver_actor=self._receiver_actor
                 )
             assert task is not None and isinstance(task, RaySendTask), \
                     "Send task is not of type RaySendTask"
@@ -1106,3 +1109,4 @@ class RayCPUConnector(KVConnectorBase_V1):
                 logger.error("✗ Error closing KV receiver: %s", e)
         
         logger.info("=== RayCPUConnector closed successfully ===")
+
