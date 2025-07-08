@@ -3,7 +3,6 @@ import contextlib
 import os
 import threading
 import time
-import uuid
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -19,14 +18,13 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size,
     get_tp_group)
 from vllm.logger import init_logger
-from vllm.utils import make_zmq_path, make_zmq_socket
 
 if TYPE_CHECKING:
     pass
 
 logger = init_logger(__name__)
 
-@ray.remote(num_cpus=1)
+@ray.remote(num_cpus=1, scheduling_strategy="DEFAULT")
 class CPUSender:
 
     def __init__(
@@ -49,7 +47,7 @@ class CPUSender:
         logger.info("CPUSender closed successfully")
 
 
-@ray.remote(num_cpus=1)
+@ray.remote(num_cpus=1, scheduling_strategy="DEFAULT")
 class CPUReceiver:
 
     def __init__(
@@ -87,6 +85,172 @@ class CPUReceiver:
             logger.info("CPUReceiver had %d received tensors", len(self._received_tensors))
             self._received_tensors.clear()
         logger.info("CPUReceiver closed successfully")
+
+class RingBufferAllocator:
+    """RingBufferAllocator is a simple ring buffer allocator for managing
+    memory allocation and deallocation.
+    """
+
+    def __init__(self, size: int, align_to: int = 256) -> None:
+        """Initialize the ring buffer allocator with the given size.
+
+        Args:
+            size (int): The size of the ring buffer (in bytes).
+            align_to (int): The alignment size (in bytes). Default is 8.
+        """
+        self._size = size
+        self._buffer = torch.empty(size, dtype=torch.uint8)
+        self._high_watermark = 0
+        self._low_watermark = 0
+        self._align_to = align_to
+
+        self._allocated: OrderedDict = OrderedDict()  # Track allocated buffers
+
+        # Register pin memory
+        cudart = torch.cuda.cudart()
+        cudart.cudaHostRegister(self._buffer.data_ptr(), size, 0)
+
+    def _align_size(self, base: int) -> int:
+        """Align the given size to the nearest multiple of the alignment size.
+
+        Args:
+            base (int): The size to be aligned.
+
+        Returns:
+            int: The aligned size.
+        """
+        return ((base - 1) // self._align_to + 1) * self._align_to
+
+    def allocate(self, size: int) -> tuple[int, Optional[torch.Tensor]]:
+        """Allocate a buffer of the given size.
+
+        Args:
+            size (int): The size of the buffer to be allocated.
+
+        Returns:
+            Optional[tuple[int, torch.Tensor]]: A tuple containing the virtual
+                address of the allocated buffer and the buffer itself. If
+                allocation fails, returns None.
+        """
+        # During allocation, we always make sure that high watermark and
+        # low watermark are aligned to the alignment size
+        aligned_size = self._align_size(size)  # Align the requested size
+        turnaround_size = (self._high_watermark // self._size + 1) * self._size
+
+        local_high = self._high_watermark % self._size
+        local_low = self._low_watermark % self._size
+
+        if local_high >= local_low:
+            if local_high == local_low and \
+                    self._high_watermark > self._low_watermark:
+                # No space available
+                return -1, None
+
+            # If high watermark + requested size is okay, directly allocate
+            if local_high + size < self._size:
+                address = self._high_watermark
+                self._allocated[address] = aligned_size
+                start = local_high
+                end = start + size
+                self._high_watermark += aligned_size
+                return address, self._buffer[start:end]
+            else:
+                # If high watermark + requested size is not okay, we need to
+                # wrap around and allocate again
+                self._high_watermark = turnaround_size
+                return self.allocate(size)
+        else:
+            # High watermark is below low watermark, check if we can allocate
+            if local_high + size < local_low:
+                address = self._high_watermark
+                self._allocated[address] = aligned_size
+                start = local_high
+                end = start + size
+                self._high_watermark += aligned_size
+                return address, self._buffer[start:end]
+            else:
+                # No space available
+                return -1, None
+
+    def view_as_tensor(self, vaddr: int, dtype: torch.dtype,
+                       shape: torch.Size) -> torch.Tensor:
+        """View the buffer as a tensor.
+        Args:
+            vaddr (int): The virtual address of the buffer.
+            dtype (torch.dtype): The data type of the tensor.
+            shape (torch.Size): The shape of the tensor.
+        Returns:
+            torch.Tensor: The tensor view of the buffer.
+        """
+        assert vaddr % self._align_to == 0, \
+            "Virtual address is not aligned to the alignment size"
+
+        paddr = self.virtual_to_physical(vaddr)
+        size = shape.numel() * dtype.itemsize
+        assert paddr + size <= self._size, \
+            "Physical address is out of bounds"
+
+        # Get the tensor
+        return self._buffer[paddr:paddr + size].view(dtype).view(shape)
+
+    def free(self, address: int) -> None:
+        """Free the buffer at the given address.
+
+        Args:
+            address (int): The virtual address of the buffer to be freed,
+                which is returned by the allocate() method.
+        """
+        assert address in self._allocated, \
+                f"Address {address} not found in allocated buffers"
+
+        # Pop the address from the allocated dict, and update the
+        # low watermark
+        self._allocated.pop(address)
+
+        # If there is nothing allocated, set low_watermark to high watermark
+        new_low_watermark = self._high_watermark
+
+        # Else, set the low_watermark to the first address in the allocated
+        # dict
+        for addr in self._allocated:
+            new_low_watermark = addr
+            break
+        self._low_watermark = new_low_watermark
+
+    @property
+    def high_watermark(self) -> int:
+        return self._high_watermark
+
+    @property
+    def low_watermark(self) -> int:
+        return self._low_watermark
+
+    def virtual_to_physical(self, vaddr: int) -> int:
+        """Convert a virtual address to a physical address.
+
+        Args:
+            vaddr (int): The virtual address to be converted.
+
+        Returns:
+            torch.Tensor: The physical address of the buffer.
+        """
+        return vaddr % self._size
+
+    def get_size(self) -> int:
+        """Get the size of the ring buffer.
+
+        Returns:
+            int: The size of the ring buffer.
+        """
+        return self._size
+
+    def get_buffer_ptr(self) -> int:
+        """Get the pointer to the buffer.
+
+        Returns:
+            int: The pointer to the buffer.
+        """
+        return self._buffer.data_ptr()
 
 class RaySendTaskManager(KVSenderInterface):
     """RaySendTaskManager is an implementation of KVSenderInterface that provides a
@@ -141,16 +305,18 @@ class RaySendTaskManager(KVSenderInterface):
         else:
             logger.debug("✓ Buffer allocated immediately for request %s", source_spec.request_id)
 
-        task = RaySendTask(buffer_vaddr=address,
-                           sender_actor=sender_actor,
-                           receiver_actor=receiver_actor,
-                           request_uuid=source_spec.request_id)
+        task = RaySendTask(
+            buffer=buffer,
+            source_spec=source_spec,
+            destination_spec=destination_spec,
+            state=SendTaskState(),
+            buffer_vaddr=address,
+            sender_actor=sender_actor,
+            receiver_actor=receiver_actor,
+            request_uuid=source_spec.request_id
+        )
         
-        # Set required attributes for compatibility with base class
-        task.tensor = buffer
-        task.buffer = buffer
-        task.source_spec = source_spec
-
+        # Remove the redundant attribute assignments since they're now set in __init__
         self.add_send_task(task)
         logger.debug("✓ Send task created and added for request %s", source_spec.request_id)
         return task
@@ -203,7 +369,7 @@ class RaySendTaskManager(KVSenderInterface):
 
     def close(self):
         self.wait_for_all_tasks()
-        self._nixl_sender.close()
+        # Note: No cleanup needed for Ray actors as they are managed by Ray
 
 
 @dataclass
@@ -214,6 +380,7 @@ class RaySendTask(SendTask):
     buffer_vaddr: int
     sender_actor: CPUSender
     receiver_actor: CPUReceiver
+    state: SendTaskState
     request_uuid: str
     
     # Optional fields with default values (must come after non-default fields)
@@ -235,14 +402,15 @@ class RaySendTask(SendTask):
         if not self.is_done() and ray.wait([self.ref], timeout=0.001, fetch_local=False):
             self.state.send_done = True
 
-        if self.state.is_ready() and not self.state.is_done():
-            self.send_task()
+        # Note: The actual sending is handled by the manager's progress() method
+        # We don't call send_task() here as it's a method of the manager, not the task
 
 
 class RayDecodeManager:
 
     def __init__(self, buffer_size: int, host: str, port: int) -> None:
         self._buffer_size = buffer_size
+        time.sleep(10)
         self._receiver_actor = ray.get_actor(f"receiver_actor_{host}_{port}")
 
         # How many tokens are received for each request, each layer
@@ -277,7 +445,7 @@ class RayDecodeManager:
         states
         """
         finished_list = self._receiver_actor.get_finished(clear=True)
-        for source_spec, vaddr in finished_list:
+        for source_spec, tensor in finished_list:
             # Get the request id and layer id
             p_request_id = source_spec.request_id
             layer_id = source_spec.layer_id
@@ -299,7 +467,7 @@ class RayDecodeManager:
             if (p_request_id, layer_id) not in self._request_specs:
                 self._request_specs[(p_request_id, layer_id)] = []
             self._request_specs[(p_request_id, layer_id)].append(
-                (source_spec, vaddr))
+                (source_spec, tensor))
 
     def progress(self) -> None:
         """Process the received requests and the data. Updates the internal
@@ -383,15 +551,13 @@ class RayDecodeManager:
         self._already_ready_requests.discard(p_request_id)
 
     def _create_decoder_kv_spec(self, source_spec: SourceSpec,
-                                vaddr: int) -> DecoderKVSpec:
-        """Create a DecoderKVSpec from the source spec and the virtual address.
+                                tensor: torch.Tensor) -> DecoderKVSpec:
+        """Create a DecoderKVSpec from the source spec and the tensor.
         """
-        # Get the correct buffer
+        # Return the decoder KV spec with the tensor directly
         return DecoderKVSpec(start=source_spec.start,
                              stop=source_spec.stop,
-                             buffer=self._allocator.view_as_tensor(
-                                 vaddr, source_spec.dtype,
-                                 source_spec.tensor_shape))
+                             buffer=tensor)
 
     def get_kv_specs(self, p_request_id: str,
                      layer_id: int) -> list[DecoderKVSpec]:
@@ -408,10 +574,10 @@ class RayDecodeManager:
                            (p_request_id, layer_id))
             return ret
 
-        for source_spec, vaddr in self._request_specs[(p_request_id,
+        for source_spec, tensor in self._request_specs[(p_request_id,
                                                        layer_id)]:
             # Create the decoder kv spec
-            decoder_kv_spec = self._create_decoder_kv_spec(source_spec, vaddr)
+            decoder_kv_spec = self._create_decoder_kv_spec(source_spec, tensor)
             ret.append(decoder_kv_spec)
 
         return ret
@@ -430,12 +596,7 @@ class RayDecodeManager:
                 assert (p_request_id, layer_id) in self._request_specs, \
                     "Found received tokens but no request specs"
 
-                # Free the memory
-                for src_spec, vaddr in self._request_specs[(p_request_id,
-                                                            layer_id)]:
-                    self._allocator.free(vaddr)
-
-                # Clear the request specs
+                # Clear the request specs (no need to free memory as tensors are managed by Ray)
                 self._request_specs.pop((p_request_id, layer_id), None)
 
         else:
@@ -445,4 +606,5 @@ class RayDecodeManager:
         self.remove_ready_request(p_request_id)
 
     def close(self):
-        self._nixl_receiver.close()
+        pass
+
