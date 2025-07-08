@@ -906,10 +906,7 @@ class RayCPUConnector(KVConnectorBase_V1):
             logger.info("Last layer (%d) loaded, freeing %d in-flight requests", 
                        layer_id, len(self._inflight_h2d_requests))
             for p_req_id in self._inflight_h2d_requests:
-                logger.info("Freeing request %s, current watermark: [%d, %d]",
-                            p_req_id,
-                            self._kv_receiver._allocator.low_watermark,
-                            self._kv_receiver._allocator.high_watermark)
+                logger.info("Freeing request %s", p_req_id)
                 self._kv_receiver.free_request(p_req_id)
             self._inflight_h2d_requests.clear()
             logger.info("✓ All in-flight requests freed")
@@ -1056,10 +1053,10 @@ class RayCPUConnector(KVConnectorBase_V1):
 
         # decoder (kv_consumer) side
         self._kv_receiver.progress()
-        p_ready_reqs = self._receiver_actor_handle.get_finished(len(self._gpu_kv_caches))
+        p_ready_reqs = self._kv_receiver.get_finished(len(self._gpu_kv_caches))
         ret = set()
         for p_req_id in p_ready_reqs:
-            if d_req_id := self._decode_req_id_to_prefill_req_id.get(p_req_id):
+            if d_req_id := self._prefill_req_id_to_decode_req_id.get(p_req_id):
                 # We have seen the corresponding decode request before.
                 # Therefore, we can return the request id.
                 ret.add(d_req_id)
