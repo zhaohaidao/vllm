@@ -495,6 +495,7 @@ class RayCPUConnector(KVConnectorBase_V1):
                 self._kv_sender_thread = threading.Thread(
                     target=self._kv_sender_processor,
                     daemon=True,
+                    name=f"RayKVSender-{self._host}:{self._port}"
                 )
                 
                 try:

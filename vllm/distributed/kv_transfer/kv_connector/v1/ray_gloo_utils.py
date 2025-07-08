@@ -398,13 +398,10 @@ class RaySendTask(SendTask):
                 and self.cuda_event.query():
             self.state.sender_ready = True
 
-        assert self.ref is not None, "Ref is not set"
-        if not self.is_done() and ray.wait([self.ref], timeout=0.001, fetch_local=False):
-            self.state.send_done = True
-
-        # Note: The actual sending is handled by the manager's progress() method
-        # We don't call send_task() here as it's a method of the manager, not the task
-
+        if self.state.is_ready() and not self.state.is_done():
+            tmp_ref = self.sender_actor.send.remote([self.source_spec, self.buffer])
+            self.ref = self.receiver_actor.recv.remote(tmp_ref)
+            self.mark_sending()
 
 class RayDecodeManager:
 
@@ -444,7 +441,7 @@ class RayDecodeManager:
         """Checks the KV cache receiving status and update the internal
         states
         """
-        finished_list = self._receiver_actor.get_finished(clear=True)
+        finished_list = ray.get(self._receiver_actor.get_finished.remote(clear=True))
         for source_spec, tensor in finished_list:
             # Get the request id and layer id
             p_request_id = source_spec.request_id
