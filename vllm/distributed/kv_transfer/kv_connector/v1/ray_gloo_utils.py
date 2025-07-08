@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import contextlib
+import os
 import threading
 import time
 import uuid
@@ -17,7 +18,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.cpu_connector_utils import (
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size,
     get_tp_group)
-from vllm.distributed.kv_transfer.kv_connector.v1.cpu_connector_utils import RingBufferAllocator
 from vllm.logger import init_logger
 from vllm.utils import make_zmq_path, make_zmq_socket
 
@@ -26,13 +26,15 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-@ray.remote(num_gpus=1)
+@ray.remote(num_cpus=1)
 class CPUSender:
 
     def __init__(
         self,
     ) -> None:
-        pass
+        logger.info("=== CPUSender Ray Actor Initialized ===")
+        logger.info("Actor PID: %d", os.getpid())
+        logger.debug("CPUSender ready to send tensors")
 
     @ray.method(tensor_transport="gloo")
     def send(self, data):
@@ -43,17 +45,21 @@ class CPUSender:
         return data
 
     def close(self) -> None:
-        pass
+        logger.info("CPUSender closing...")
+        logger.info("CPUSender closed successfully")
 
 
-@ray.remote(num_gpus=1)
+@ray.remote(num_cpus=1)
 class CPUReceiver:
 
     def __init__(
         self,
     ) -> None:
+        logger.info("=== CPUReceiver Ray Actor Initialized ===")
+        logger.info("Actor PID: %d", os.getpid())
         self._tensor_lock = threading.Lock()
         self._received_tensors: dict[str, tuple[SourceSpec, torch.Tensor]] = {}
+        logger.debug("CPUReceiver ready to receive tensors")
 
     def recv(self, data):
         source_spec = data[0]
@@ -64,6 +70,8 @@ class CPUReceiver:
         assert source_spec.request_id not in self._received_tensors, f"Request {source_spec.request_id} already received"
         with self._tensor_lock:
             self._received_tensors[source_spec.request_id] = (source_spec, cpu_tensor)
+        
+        logger.debug("✓ Tensor stored for request %s", source_spec.request_id)
     
     def get_finished(self, clear=False) -> list[tuple[SourceSpec, torch.Tensor]]:
         with self._tensor_lock:
@@ -74,7 +82,11 @@ class CPUReceiver:
             return ret
 
     def close(self):
-        pass
+        logger.info("CPUReceiver closing...")
+        with self._tensor_lock:
+            logger.info("CPUReceiver had %d received tensors", len(self._received_tensors))
+            self._received_tensors.clear()
+        logger.info("CPUReceiver closed successfully")
 
 class RaySendTaskManager(KVSenderInterface):
     """RaySendTaskManager is an implementation of KVSenderInterface that provides a
@@ -83,9 +95,12 @@ class RaySendTaskManager(KVSenderInterface):
     """
 
     def __init__(self, buffer_size: int) -> None:
+        logger.info("=== RaySendTaskManager Initialization ===")
+        logger.info("Buffer size: %.2f GB (%d bytes)", buffer_size / (1 << 30), buffer_size)
         super().__init__()
         self._buffer_size = buffer_size
         self._allocator = RingBufferAllocator(self._buffer_size)
+        logger.info("✓ RaySendTaskManager initialized successfully")
 
     def create_send_task(
         self,
@@ -102,23 +117,42 @@ class RaySendTaskManager(KVSenderInterface):
             destination_spec (DestinationSpec): The destination 
                 specification of the send task.
         """
+        logger.debug("Creating send task for request: %s", source_spec.request_id)
+        
         # Allocate a buffer for the send task
         size = source_spec.get_size()
+        logger.debug("Allocating buffer of size: %.2f MB (%d bytes)", size / (1 << 20), size)
+        
         address, buffer = self._allocator.allocate(size)
+        retry_count = 0
         while address == -1:
             # If allocation fails, wait for a while to process
             # and try again
+            retry_count += 1
+            if retry_count % 1000 == 0:  # Log every 1000 retries
+                logger.debug("Buffer allocation retry %d for request %s", retry_count, source_spec.request_id)
             time.sleep(0.001)
             self.progress()
             address, buffer = self._allocator.allocate(size)
         assert buffer is not None, "Buffer allocation failed"
+        
+        if retry_count > 0:
+            logger.debug("✓ Buffer allocated after %d retries for request %s", retry_count, source_spec.request_id)
+        else:
+            logger.debug("✓ Buffer allocated immediately for request %s", source_spec.request_id)
 
-        task = RaySendTask(cuda_event=None,
+        task = RaySendTask(buffer_vaddr=address,
                            sender_actor=sender_actor,
                            receiver_actor=receiver_actor,
                            request_uuid=source_spec.request_id)
+        
+        # Set required attributes for compatibility with base class
+        task.tensor = buffer
+        task.buffer = buffer
+        task.source_spec = source_spec
 
         self.add_send_task(task)
+        logger.debug("✓ Send task created and added for request %s", source_spec.request_id)
         return task
 
     def free_task(self, task: SendTask) -> None:
@@ -174,19 +208,16 @@ class RaySendTaskManager(KVSenderInterface):
 
 @dataclass
 class RaySendTask(SendTask):
-    """NixlSendTask is a send task that uses CPU memory for the buffer and
-    Nixl for sending.
+    """RaySendTask is a send task that uses CPU memory for the buffer and
+    Ray for sending.
     """
     buffer_vaddr: int
-    
     sender_actor: CPUSender
     receiver_actor: CPUReceiver
-    ref: Optional[ray.ObjectRef] = None
-
     request_uuid: str
-
-    # Optional fields that will be updated later
-    # Cuda event for h2d copy
+    
+    # Optional fields with default values (must come after non-default fields)
+    ref: Optional[ray.ObjectRef] = None
     cuda_event: Optional[torch.cuda.Event] = None
 
     def __post_init__(self) -> None:

@@ -408,9 +408,18 @@ class RayCPUConnector(KVConnectorBase_V1):
 
     def __init__(self, vllm_config: "VllmConfig",
                  role: KVConnectorRole) -> None:
+        logger.info("=== RayCPUConnector Initialization Started ===")
+        logger.info("Role: %s", role)
+        logger.info("KV Transfer Config: %s", vllm_config.kv_transfer_config)
+        
         super().__init__(vllm_config, role)
+        # Store role for later use
+        self._role = role
 
+        logger.debug("Validating KV transfer configuration...")
         validate_kv_transfer_config(vllm_config.kv_transfer_config)
+        logger.info("✓ KV transfer configuration validated successfully")
+        
         extra_config = vllm_config.kv_transfer_config.kv_connector_extra_config
         self._host = extra_config["host"]
         self._port = int(extra_config["port"])
@@ -419,42 +428,102 @@ class RayCPUConnector(KVConnectorBase_V1):
         kv_size_in_bytes = int(kv_size_in_bytes) & (~0xFFF)  # Align to 4K
         self._kv_size = kv_size_in_bytes
 
+        logger.info("RayCPUConnector configuration:")
+        logger.info("  Host: %s", self._host)
+        logger.info("  Port: %d", self._port)
+        logger.info("  KV Size: %.2f GB (%d bytes)", 
+                   self._kv_size / (1 << 30), self._kv_size)
+
         self.kv_role = vllm_config.kv_transfer_config.kv_role
+        logger.info("  KV Role: %s", self.kv_role)
 
         self._block_size = vllm_config.cache_config.block_size
+        logger.info("  Block Size: %d", self._block_size)
 
         # (prefill_request_id, layer_id) -> ray.ObjectRef
         self._transferring_tasks: list[RaySendTask] = []
 
         if role == KVConnectorRole.SCHEDULER:
+            logger.info("Initializing as SCHEDULER role")
             self._should_be_ready_reqs: set[str] = set()
         elif role == KVConnectorRole.WORKER:
+            logger.info("Initializing as WORKER role with kv_role: %s", self.kv_role)
+            
             # Prefiller side sender
             if self.kv_role == "kv_producer":
+                logger.info("Setting up KV PRODUCER components...")
+                
+                try:
+                    logger.debug("Creating CPUSender remote actor...")
+                    self._sender_actor = CPUSender.remote()
+                    logger.info("✓ CPUSender actor created successfully")
+                except Exception as e:
+                    logger.error("✗ Failed to create CPUSender actor: %s", e)
+                    raise
 
-                self._sender_actor = CPUSender.remote()
-                # TODO: name includes dest rank, host, port
-                self._receiver_actor = CPUReceiver.options(name=f"receiver_actor_{self._host}_{self._port}").remote()
-                create_collective_group([self._sender_actor, self._receiver_actor], backend="torch_gloo")
+                try:
+                    logger.debug("Creating CPUReceiver remote actor with name: receiver_actor_%s_%d", 
+                               self._host, self._port)
+                    self._receiver_actor = CPUReceiver.options(
+                        name=f"receiver_actor_{self._host}_{self._port}"
+                    ).remote()
+                    logger.info("✓ CPUReceiver actor created successfully")
+                except Exception as e:
+                    logger.error("✗ Failed to create CPUReceiver actor: %s", e)
+                    raise
 
-                self._kv_sender = RaySendTaskManager(self._kv_size)
+                try:
+                    logger.debug("Creating collective group with torch_gloo backend...")
+                    create_collective_group([self._sender_actor, self._receiver_actor], backend="torch_gloo")
+                    logger.info("✓ Collective group created successfully")
+                except Exception as e:
+                    logger.error("✗ Failed to create collective group: %s", e)
+                    raise
+
+                try:
+                    logger.debug("Creating RaySendTaskManager with buffer size: %d bytes", self._kv_size)
+                    self._kv_sender = RaySendTaskManager(self._kv_size)
+                    logger.info("✓ RaySendTaskManager created successfully")
+                except Exception as e:
+                    logger.error("✗ Failed to create RaySendTaskManager: %s", e)
+                    raise
+
+                logger.debug("Setting up KV sender thread...")
                 self._kv_sender_lock = threading.Lock()
                 self._kv_sender_stop_event = threading.Event()
                 self._kv_sender_thread = threading.Thread(
                     target=self._kv_sender_processor,
                     daemon=True,
                 )
-                self._kv_sender_thread.start()
+                
+                try:
+                    self._kv_sender_thread.start()
+                    logger.info("✓ KV sender thread started successfully")
+                except Exception as e:
+                    logger.error("✗ Failed to start KV sender thread: %s", e)
+                    raise
 
             elif self.kv_role == "kv_consumer":
-                self._kv_receiver = RayDecodeManager(
-                    self._kv_size,
-                    self._host,
-                    self._port,
-                )
+                logger.info("Setting up KV CONSUMER components...")
+                
+                try:
+                    logger.debug("Creating RayDecodeManager with size: %d, host: %s, port: %d",
+                               self._kv_size, self._host, self._port)
+                    self._kv_receiver = RayDecodeManager(
+                        self._kv_size,
+                        self._host,
+                        self._port,
+                    )
+                    logger.info("✓ RayDecodeManager created successfully")
+                except Exception as e:
+                    logger.error("✗ Failed to create RayDecodeManager: %s", e)
+                    raise
             else:
-                raise ValueError(f"Unknown kv_role: {self.kv_role}")
+                error_msg = f"Unknown kv_role: {self.kv_role}"
+                logger.error("✗ %s", error_msg)
+                raise ValueError(error_msg)
 
+        logger.debug("Initializing data structures...")
         # request_id -> prefill request trackers
         self._prefill_reqs: dict[str, PrefillRequestTracker] = {}
 
@@ -465,7 +534,13 @@ class RayCPUConnector(KVConnectorBase_V1):
         self._kv_page_shape: torch.Size = torch.Size([0])
 
         # separate cuda streams
-        self._cuda_stream = torch.cuda.Stream()
+        logger.debug("Creating CUDA stream...")
+        try:
+            self._cuda_stream = torch.cuda.Stream()
+            logger.info("✓ CUDA stream created successfully")
+        except Exception as e:
+            logger.error("✗ Failed to create CUDA stream: %s", e)
+            raise
 
         # Decode request id to prefill request id mapping
         self._decode_req_id_to_prefill_req_id: dict[str, str] = {}
@@ -481,6 +556,14 @@ class RayCPUConnector(KVConnectorBase_V1):
 
         # In-progress kv load requests's prefill request ids
         self._inflight_h2d_requests: set[str] = set()
+        
+        logger.info("=== RayCPUConnector Initialization Completed Successfully ===")
+        logger.info("Final state:")
+        logger.info("  Role: %s", role)
+        logger.info("  KV Role: %s", self.kv_role)
+        logger.info("  Host: %s, Port: %d", self._host, self._port)
+        logger.info("  KV Size: %.2f GB", self._kv_size / (1 << 30))
+        logger.info("  Block Size: %d", self._block_size)
 
     def _connect_request_ids(self, p_reqid: str, d_reqid: str) -> None:
         self._decode_req_id_to_prefill_req_id[d_reqid] = p_reqid
@@ -653,10 +736,16 @@ class RayCPUConnector(KVConnectorBase_V1):
     #############################################################
     def _kv_sender_processor(self) -> None:
         """Process the KV sender tasks in a separate thread."""
+        logger.info("KV sender processor thread started")
+        task_count = 0
         while not self._kv_sender_stop_event.is_set():
             with self._kv_sender_lock:
                 self._kv_sender.progress()
+            task_count += 1
+            if task_count % 10000 == 0:  # Log every 10000 iterations
+                logger.debug("KV sender processor running, iteration: %d", task_count)
             time.sleep(0.001)  # Sleep for a short time to avoid busy waiting
+        logger.info("KV sender processor thread stopped")
 
     def _get_layer_id(self, layer_name: str) -> int:
         assert layer_name in self._layer_name_to_id, \
@@ -675,12 +764,19 @@ class RayCPUConnector(KVConnectorBase_V1):
         ) + self._kv_page_shape)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        logger.info("=== Registering KV Caches ===")
+        logger.info("Number of KV cache layers: %d", len(kv_caches))
+        
         self._gpu_kv_caches = kv_caches
         for idx, layer_name in enumerate(kv_caches):
             self._layer_name_to_id[layer_name] = idx
             self._layer_id_to_name[idx] = layer_name
+            logger.debug("Registered layer %d: %s, shape: %s", 
+                        idx, layer_name, kv_caches[layer_name].shape)
 
         self._kv_page_shape = kv_caches[list(kv_caches.keys())[0]].shape[2:]
+        logger.info("KV page shape: %s", self._kv_page_shape)
+        logger.info("✓ KV caches registered successfully")
 
     def start_load_kv(self, forward_context: "ForwardContext",
                       **kwargs) -> None:
@@ -698,17 +794,24 @@ class RayCPUConnector(KVConnectorBase_V1):
             the same.
             
         """
+        logger.debug("start_load_kv called with role: %s", self.kv_role)
         if self.kv_role == "kv_producer":
             # encoder side
+            logger.debug("Skipping start_load_kv for kv_producer role")
             return
 
+        logger.info("=== Starting KV Load ===")
         meta = self._get_connector_metadata()
         assert isinstance(meta, CPUConnectorMetadata), \
                 "Connector metadata is not of type CPUConnectorMetadata"
 
+        logger.debug("Decode metadata count: %d", len(meta.decode_meta))
+        
         ready_decode_metas = []
         total_expected_tokens = []
         for decode_meta in meta.decode_meta:
+            logger.debug("Processing decode_meta: req_id=%s, prefill_req_id=%s, is_ready=%s",
+                        decode_meta.req_id, decode_meta.prefill_req_id, decode_meta.is_ready)
             self._connect_request_ids(decode_meta.prefill_req_id,
                                       decode_meta.req_id)
             if decode_meta.is_ready:
@@ -717,19 +820,30 @@ class RayCPUConnector(KVConnectorBase_V1):
                         len(decode_meta.block_ids) * \
                         self._block_size)
                 self._inflight_h2d_requests.add(decode_meta.prefill_req_id)
+                logger.debug("Added ready decode meta: req_id=%s, blocks=%d, tokens=%d",
+                           decode_meta.req_id, len(decode_meta.block_ids), 
+                           len(decode_meta.block_ids) * self._block_size)
 
         # Vars needed:
         #   decode_meta.prefill_req_id
         if len(ready_decode_metas) == 0:
+            logger.info("No ready decode metas, skipping KV load")
             return
 
+        logger.info("Starting KV load for %d ready requests", len(ready_decode_metas))
+        
         for layer_id in range(len(self._gpu_kv_caches)):
+            layer_name = self._layer_id_to_name[layer_id]
+            logger.debug("Processing layer %d (%s)", layer_id, layer_name)
+            
             for decode_meta, total_expected in zip(ready_decode_metas,
                                                    total_expected_tokens):
+                logger.debug("Getting KV specs for request %s, layer %d", 
+                           decode_meta.prefill_req_id, layer_id)
                 decode_specs = self._kv_receiver.get_kv_specs(
                     decode_meta.prefill_req_id, layer_id)
-                layer_name = self._layer_id_to_name[layer_id]
                 dst_layer = self._gpu_kv_caches[layer_name]
+                
                 for decode_spec in decode_specs:
                     start = decode_spec.start
                     stop = min(decode_spec.stop, total_expected)
@@ -738,6 +852,9 @@ class RayCPUConnector(KVConnectorBase_V1):
                     src_buffer = decode_spec.buffer
                     block_ids = decode_meta.block_ids
 
+                    logger.debug("Copying h2d: start=%d, stop=%d, blocks=%s",
+                               start, stop, block_ids)
+                    
                     with torch.cuda.stream(self._cuda_stream):
                         h2d_page_copy(src_buffer, dst_layer, block_ids, start,
                                       stop, self._block_size)
@@ -746,7 +863,9 @@ class RayCPUConnector(KVConnectorBase_V1):
             event = torch.cuda.Event()
             event.record(self._cuda_stream)
             self._decoder_cuda_events[layer_id] = event
+            logger.debug("Recorded CUDA event for layer %d", layer_id)
 
+        logger.info("✓ KV load initiated for %d layers", len(self._gpu_kv_caches))
         # TODO (ApostaC): Potential optimizations
         # 1. coalesce the h2d page copy to a single call
         # 2. Don't launch all the layers, but just first 2 layers
@@ -763,17 +882,28 @@ class RayCPUConnector(KVConnectorBase_V1):
         Args:
             layer_name: the name of that layer
         """
+        logger.debug("wait_for_layer_load called for layer: %s (role: %s)", 
+                    layer_name, self.kv_role)
         if self.kv_role == "kv_producer":
             # encoder side
+            logger.debug("Skipping wait_for_layer_load for kv_producer role")
             return
 
         layer_id = self._get_layer_id(layer_name)
+        logger.debug("Waiting for layer %d (%s) to load", layer_id, layer_name)
+        
         event = self._decoder_cuda_events.pop(layer_id, None)
         if event is not None:
+            logger.debug("Synchronizing CUDA event for layer %d", layer_id)
             event.synchronize()
+            logger.debug("✓ Layer %d synchronized", layer_id)
+        else:
+            logger.debug("No CUDA event found for layer %d", layer_id)
 
         if layer_id == len(self._gpu_kv_caches) - 1:
             # Free the memory for the whole request
+            logger.info("Last layer (%d) loaded, freeing %d in-flight requests", 
+                       layer_id, len(self._inflight_h2d_requests))
             for p_req_id in self._inflight_h2d_requests:
                 logger.info("Freeing request %s, current watermark: [%d, %d]",
                             p_req_id,
@@ -781,6 +911,7 @@ class RayCPUConnector(KVConnectorBase_V1):
                             self._kv_receiver._allocator.high_watermark)
                 self._kv_receiver.free_request(p_req_id)
             self._inflight_h2d_requests.clear()
+            logger.info("✓ All in-flight requests freed")
 
     def save_kv_layer(self, layer_name: str, kv_layer: torch.Tensor,
                       attn_metadata: "AttentionMetadata", **kwargs) -> None:
@@ -796,16 +927,28 @@ class RayCPUConnector(KVConnectorBase_V1):
             attn_metadata (AttentionMetadata): the attention metadata.
             **kwargs: additional arguments for the save operation.
         """
+        logger.debug("save_kv_layer called for layer: %s (role: %s)", 
+                    layer_name, self.kv_role)
+        
         if self.kv_role == "kv_consumer":
             # decoder side
+            logger.debug("Skipping save_kv_layer for kv_consumer role")
             return
 
+        logger.info("=== Saving KV Layer: %s ===", layer_name)
         meta = self._get_connector_metadata()
         assert isinstance(meta, CPUConnectorMetadata), \
                 "Connector metadata is not of type CPUConnectorMetadata"
         assert self._kv_sender is not None
 
+        logger.debug("Processing %d prefill requests for layer %s", 
+                    len(meta.prefill_meta), layer_name)
+
         for prefill_req in meta.prefill_meta:
+            logger.debug("Processing prefill request: %s", prefill_req.req_id)
+            logger.debug("  Blocks to save: %s", prefill_req.blocks_to_save)
+            logger.debug("  Token range: %s", prefill_req.token_range)
+            
             # Create a source spec with serializable types
             source_spec = SourceSpec(
                 request_id=prefill_req.req_id,
@@ -826,6 +969,7 @@ class RayCPUConnector(KVConnectorBase_V1):
                 base_port=self._port,
             )
 
+            logger.debug("Creating send task for request %s", prefill_req.req_id)
             task = None
             # Create the send task
             with self._kv_sender_lock:
@@ -835,9 +979,12 @@ class RayCPUConnector(KVConnectorBase_V1):
                 )
             assert task is not None and isinstance(task, RaySendTask), \
                     "Send task is not of type RaySendTask"
+            logger.debug("✓ Send task created for request %s", prefill_req.req_id)
 
             # Start copying the data to the CPU buffer
             buffer = task.tensor
+            logger.debug("Starting d2h page copy for request %s", prefill_req.req_id)
+            
             self._cuda_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._cuda_stream):
                 # Copy the data from the GPU to the CPU buffer page by page
@@ -850,7 +997,9 @@ class RayCPUConnector(KVConnectorBase_V1):
             task.cuda_event.record(self._cuda_stream)
 
             self._transferring_tasks.append(task)
+            logger.debug("✓ D2H copy initiated for request %s", prefill_req.req_id)
 
+        logger.info("✓ KV layer %s saved for %d requests", layer_name, len(meta.prefill_meta))
         # TODO(ApostaC): Potential optimizations
         # 1. coalesce the d2h page copy to a single call
         # 2. use a single cuda event instead of a list of cuda events
@@ -864,16 +1013,27 @@ class RayCPUConnector(KVConnectorBase_V1):
 
         This prevents overwrites of paged KV buffer before saving done.
         """
+        logger.debug("wait_for_save called (role: %s)", self.kv_role)
+        
         if self.kv_role == "kv_consumer":
             # decoder side
+            logger.debug("Skipping wait_for_save for kv_consumer role")
             return
 
-        for task in self._transferring_tasks:
+        if len(self._transferring_tasks) == 0:
+            logger.debug("No transferring tasks to wait for")
+            return
+
+        logger.info("Waiting for %d save operations to complete", len(self._transferring_tasks))
+        
+        for i, task in enumerate(self._transferring_tasks):
             assert task.cuda_event is not None, \
                     "CUDA event is not set for the task"
+            logger.debug("Synchronizing CUDA event for task %d", i)
             task.cuda_event.synchronize()
 
         self._transferring_tasks.clear()
+        logger.info("✓ All save operations completed")
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -920,12 +1080,29 @@ class RayCPUConnector(KVConnectorBase_V1):
 
         This prevents overwrites of paged KV buffer before saving done.
         """
+        logger.info("=== Closing RayCPUConnector ===")
+        logger.info("Role: %s, KV Role: %s", self._role, self.kv_role)
+        
         if hasattr(self, "_kv_sender") and self._kv_sender is not None:
+            logger.info("Stopping KV sender...")
             self._kv_sender_stop_event.set()
             if hasattr(self, "_kv_sender_thread") and \
                     self._kv_sender_thread is not None:
+                logger.debug("Joining KV sender thread...")
                 self._kv_sender_thread.join()
-            self._kv_sender.close()
+                logger.info("✓ KV sender thread joined")
+            try:
+                self._kv_sender.close()
+                logger.info("✓ KV sender closed")
+            except Exception as e:
+                logger.error("✗ Error closing KV sender: %s", e)
 
         if hasattr(self, "_kv_receiver") and self._kv_receiver is not None:
-            self._kv_receiver.close()
+            logger.info("Closing KV receiver...")
+            try:
+                self._kv_receiver.close()
+                logger.info("✓ KV receiver closed")
+            except Exception as e:
+                logger.error("✗ Error closing KV receiver: %s", e)
+        
+        logger.info("=== RayCPUConnector closed successfully ===")
