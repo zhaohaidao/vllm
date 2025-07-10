@@ -745,7 +745,7 @@ class RayCPUConnector(KVConnectorBase_V1):
                 self._kv_sender.progress()
             task_count += 1
             if task_count % 10000 == 0:  # Log every 10000 iterations
-                logger.debug("KV sender processor running, iteration: %d", task_count)
+                logger.info("KV sender processor running, iteration: %d", task_count)
             time.sleep(0.001)  # Sleep for a short time to avoid busy waiting
         logger.info("KV sender processor thread stopped")
 

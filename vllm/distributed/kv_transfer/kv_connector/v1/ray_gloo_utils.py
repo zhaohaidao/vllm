@@ -38,7 +38,7 @@ class CPUSender:
     def send(self, data):
         source_spec = data[0]
         cpu_tensor = data[1]
-        logger.debug(f"Sending tensor for request {source_spec.request_id} with spec {source_spec} and shape {cpu_tensor.shape}")
+        logger.info(f"Sending tensor for request {source_spec.request_id} with spec {source_spec} and shape {cpu_tensor.shape}")
 
         return data
 
@@ -342,11 +342,9 @@ class RaySendTaskManager(KVSenderInterface):
         """
         assert isinstance(task, RaySendTask), \
             "Task is not a NixlSendTask"
-        assert task.ref is not None, "Ref is not set"
         tmp_ref = task.sender_actor.send.remote([task.source_spec, task.buffer])
         task.ref = task.receiver_actor.recv.remote(tmp_ref)
         task.mark_sending()
-        return
 
     def pre_progress_hook(self) -> None:
         for task in self.get_send_tasks():
@@ -398,10 +396,8 @@ class RaySendTask(SendTask):
                 and self.cuda_event.query():
             self.state.sender_ready = True
 
-        if self.state.is_ready() and not self.state.is_done():
-            tmp_ref = self.sender_actor.send.remote([self.source_spec, self.buffer])
-            self.ref = self.receiver_actor.recv.remote(tmp_ref)
-            self.mark_sending()
+        if not self.is_done() and self.is_sending() and ray.wait([self.ref], timeout=0.001, fetch_local=False):
+            self.state.send_done = True
 
 class RayDecodeManager:
 

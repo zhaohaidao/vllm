@@ -131,3 +131,8 @@ KVConnectorFactory.register_connector(
     "CPUConnector",
     "vllm.distributed.kv_transfer.kv_connector.v1.cpu_connector",
     "CPUConnector")
+
+KVConnectorFactory.register_connector(
+    "RayCPUConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.ray_cpu_connector",
+    "RayCPUConnector")
