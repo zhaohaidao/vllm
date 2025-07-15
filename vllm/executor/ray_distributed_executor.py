@@ -100,6 +100,18 @@ class RayDistributedExecutor(DistributedExecutorBase):
         if ray_usage != "1":
             os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 
+        # Set Ray compiled DAG timeout early to ensure it takes effect
+        # before any DAG compilation occurs
+        if self.use_ray_compiled_dag:
+            # Enlarge the default value of "RAY_CGRAPH_get_timeout" to 300 seconds
+            # (it is 10 seconds by default). This is a Ray environment variable to
+            # control the timeout of getting result from a compiled graph execution,
+            # i.e., the distributed execution that includes model forward runs and
+            # intermediate tensor communications, in the case of vllm.
+            os.environ["RAY_CGRAPH_get_timeout"] = "300"  # noqa: SIM112
+            logger.info("RAY_CGRAPH_get_timeout is set to %s",
+                        os.environ["RAY_CGRAPH_get_timeout"])  # noqa: SIM112
+
         # Create the parallel GPU workers.
         self._init_workers_ray(placement_group)
 
